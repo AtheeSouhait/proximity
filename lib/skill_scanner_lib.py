@@ -134,6 +134,97 @@ REMEDIATION_GUIDANCE = {
     "missing_field": "Add the missing required field to the SKILL.md frontmatter for proper skill identification.",
     "recommended_field": "Consider adding this recommended field to improve skill documentation and discoverability.",
     "undeclared_tool": "The code uses capabilities not declared in allowed-tools. Add the required tool to allowed-tools or remove the code.",
+    "hooks_detected": "Review all hook definitions carefully. Hooks execute automatically during Claude Code lifecycle events. Remove hooks unless they are essential and from a trusted source.",
+    "dangerous_hook_command": "This hook command contains suspicious shell patterns. Remove the hook or replace it with a safer alternative.",
+    "hook_http_endpoint": "This hook sends event data to an HTTP endpoint. Verify the endpoint is trusted and required for the skill.",
+    "hook_unknown_event": "This hook uses an unrecognized or unsupported event name. Verify it against the current Claude Code hooks documentation.",
+    "hook_unknown_type": "This hook uses an unrecognized type. Verify it against the current Claude Code hooks documentation.",
+    "hook_malformed_config": "The hooks frontmatter is present but malformed. Verify that it is a mapping of event names to matcher groups.",
+    "hook_malformed_event_entries": "Each hook event must map to a list of matcher groups.",
+    "hook_malformed_matcher_group": "Each matcher group must be an object containing an optional matcher and a hooks list.",
+    "hook_malformed_hooks_list": "Each matcher group must contain a 'hooks' list of hook handler objects.",
+    "hook_malformed_hook_item": "Each entry in a matcher group's hooks list must be an object.",
+    "hook_invalid_matcher": "Matcher values must be regex strings. Use '*', empty string, or omit matcher to match all occurrences.",
+    "hook_missing_required_field": "Hook handlers must include required fields by type (command/url/prompt).",
+    "hook_async_not_command": "The async field is only valid on command hooks.",
+}
+
+# Claude Code hook validation constants based on the current hooks docs.
+VALID_HOOK_EVENTS = {
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest",
+    "PostToolUse", "PostToolUseFailure", "Notification", "SubagentStart",
+    "SubagentStop", "Stop", "StopFailure", "TeammateIdle", "TaskCompleted",
+    "InstructionsLoaded", "ConfigChange", "WorktreeCreate", "WorktreeRemove",
+    "PreCompact", "PostCompact", "Elicitation", "ElicitationResult", "SessionEnd"
+}
+
+VALID_HOOK_TYPES = {"command", "http", "prompt", "agent"}
+
+# Events that support all hook types (command/http/prompt/agent)
+ALL_TYPE_HOOK_EVENTS = {
+    "PermissionRequest", "PostToolUse", "PostToolUseFailure", "PreToolUse",
+    "Stop", "SubagentStop", "TaskCompleted", "UserPromptSubmit"
+}
+
+NO_MATCHER_EVENTS = {
+    "UserPromptSubmit", "Stop", "TeammateIdle", "TaskCompleted",
+    "WorktreeCreate", "WorktreeRemove"
+}
+
+COMMAND_ONLY_EVENTS = {
+    "ConfigChange", "Elicitation", "ElicitationResult", "InstructionsLoaded",
+    "Notification", "PostCompact", "PreCompact", "SessionEnd", "SessionStart",
+    "StopFailure", "SubagentStart", "TeammateIdle",
+    "WorktreeCreate", "WorktreeRemove"
+}
+
+REQUIRED_HOOK_FIELD_BY_TYPE = {
+    "command": "command",
+    "http": "url",
+    "prompt": "prompt",
+    "agent": "prompt"
+}
+
+SUSPICIOUS_HOOK_COMMAND_PATTERNS = [
+    (r"curl\s+[^|]*\|\s*(bash|sh|zsh)", "Curl pipe to shell - remote code execution"),
+    (r"wget\s+[^|]*\|\s*(bash|sh|zsh)", "Wget pipe to shell - remote code execution"),
+    (r"\$\(curl\s|\$\(wget\s|`curl\s|`wget\s", "Command substitution with download"),
+    (r"rm\s+-rf\s+(?:/($|\s)|~($|\s)|~/(?:$|\s)|/(?:home|Users|root|etc|usr|var|opt|bin|sbin|lib|lib64)\b)", "Recursive forced deletion of critical system/home paths"),
+    (r"chmod\s+777", "World-writable permissions"),
+    (r">\s*/etc/", "Write to system configuration directory"),
+    (r"nc\s+.*-[elp]|ncat\s+.*-[elp]|netcat\s+.*-[elp]", "Netcat listener or exec"),
+    (r"/dev/tcp/|/dev/udp/", "Shell network redirection"),
+    (r"mkfifo\s+/tmp/", "Named pipe creation"),
+    (r"crontab\s", "Cron job manipulation"),
+    (r"nohup\s.*&", "Background persistent process"),
+    (r"base64\s+(-d|--decode)", "Base64 decode"),
+    (r"eval\s", "Shell eval"),
+    (r"python[23]?\s+-c\s", "Inline Python execution"),
+    (r"perl\s+-e\s", "Inline Perl execution"),
+    (r"ruby\s+-e\s", "Inline Ruby execution"),
+    (r"(?:^|[;&|]\s*)ssh\s+[^;&|\n]*@", "SSH connection"),
+    (r"\bscp\s+", "SCP file transfer"),
+]
+
+HOOK_COMMAND_PATTERN_REMEDIATION = {
+    r"curl\s+[^|]*\|\s*(bash|sh|zsh)": "Never pipe downloaded content to a shell. Download, verify, then execute.",
+    r"wget\s+[^|]*\|\s*(bash|sh|zsh)": "Never pipe downloaded content to a shell. Download, verify, then execute.",
+    r"\$\(curl\s|\$\(wget\s|`curl\s|`wget\s": "Avoid command substitution with downloaded content. Download to a file and inspect it first.",
+    r"rm\s+-rf\s+(?:/($|\s)|~($|\s)|~/(?:$|\s)|/(?:home|Users|root|etc|usr|var|opt|bin|sbin|lib|lib64)\b)": "Avoid recursive deletion of broad system or home paths. Scope deletions to explicit project files only.",
+    r"chmod\s+777": "Avoid world-writable permissions. Use the minimum required permission bits.",
+    r">\s*/etc/": "Do not write to system configuration paths from a skill hook unless strictly required and documented.",
+    r"nc\s+.*-[elp]|ncat\s+.*-[elp]|netcat\s+.*-[elp]": "Remove netcat exec/listener behavior. It is commonly associated with remote shell access.",
+    r"/dev/tcp/|/dev/udp/": "Avoid shell-level network redirection. Use explicit, documented networking only where required.",
+    r"mkfifo\s+/tmp/": "Review named pipe usage carefully. It is commonly used in shell backchannel patterns.",
+    r"crontab\s": "Avoid persistence mechanisms like cron from hooks unless they are explicitly intended and documented.",
+    r"nohup\s.*&": "Avoid detached background processes from hooks. Keep hook behavior bounded and observable.",
+    r"base64\s+(-d|--decode)": "Review decoded content carefully. Encoded payloads can hide unsafe behavior.",
+    r"eval\s": "Remove shell eval usage. Prefer explicit commands and arguments.",
+    r"python[23]?\s+-c\s": "Avoid inline Python execution from hooks. Move logic to a reviewed script if it is required.",
+    r"perl\s+-e\s": "Avoid inline Perl execution from hooks. Move logic to a reviewed script if it is required.",
+    r"ruby\s+-e\s": "Avoid inline Ruby execution from hooks. Move logic to a reviewed script if it is required.",
+    r"(?:^|[;&|]\s*)ssh\s+[^;&|\n]*@": "Review remote access usage carefully and document why it is required.",
+    r"\bscp\s+": "Review file transfer usage carefully and document why it is required.",
 }
 
 
@@ -543,6 +634,276 @@ class SkillScanner:
 
         return analysis
 
+    def _analyze_hooks(self, hooks_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analyze hooks frontmatter for discovery and lightweight static validation.
+
+        Args:
+            hooks_data: Parsed hooks frontmatter object
+
+        Returns:
+            Dict with hook analysis results
+        """
+        analysis = {
+            "raw_value": hooks_data,
+            "hook_events": [],
+            "total_hooks": 0,
+            "valid_hook_handlers": 0,
+            "invalid_hook_handlers": 0,
+            "hooks_by_type": {},
+            "hooks": [],
+            "suspicious_commands": [],
+            "http_endpoints": [],
+            "unknown_events": [],
+            "unknown_hook_types": [],
+            "ignored_matchers": [],
+            "invalid_matchers": [],
+            "malformed_event_entries": [],
+            "malformed_matcher_groups": [],
+            "malformed_hooks_lists": [],
+            "malformed_hook_items": [],
+            "missing_required_fields": [],
+            "async_not_command": [],
+            "wrong_type_hooks": [],
+            "risk_level": "low",
+            "config_quality": "clean",
+            "behavioral_risk_reasons": [],
+            "config_quality_reasons": []
+        }
+
+        if not isinstance(hooks_data, dict):
+            return analysis
+
+        seen_command_findings = set()
+
+        for event_name, entries in hooks_data.items():
+            event_name = str(event_name)
+            analysis["hook_events"].append(event_name)
+            event_supported = event_name in VALID_HOOK_EVENTS
+
+            if not event_supported and event_name not in analysis["unknown_events"]:
+                analysis["unknown_events"].append(event_name)
+
+            if not isinstance(entries, list):
+                analysis["malformed_event_entries"].append({
+                    "event": event_name,
+                    "actual_type": type(entries).__name__
+                })
+                continue
+
+            for entry_index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    analysis["malformed_matcher_groups"].append({
+                        "event": event_name,
+                        "index": entry_index,
+                        "actual_type": type(entry).__name__
+                    })
+                    continue
+
+                matcher_present = "matcher" in entry
+                matcher = entry.get("matcher") if matcher_present else None
+                matcher_value = str(matcher) if matcher is not None else None
+
+                if matcher_present:
+                    if not isinstance(matcher, str):
+                        analysis["invalid_matchers"].append({
+                            "event": event_name,
+                            "matcher": matcher_value,
+                            "reason": f"matcher must be a string, got {type(matcher).__name__}"
+                        })
+                    elif matcher not in {"", "*"}:
+                        try:
+                            re.compile(matcher)
+                        except re.error as err:
+                            analysis["invalid_matchers"].append({
+                                "event": event_name,
+                                "matcher": matcher,
+                                "reason": f"invalid regex: {err}"
+                            })
+
+                if matcher_present and event_name in NO_MATCHER_EVENTS:
+                    analysis["ignored_matchers"].append({
+                        "event": event_name,
+                        "matcher": matcher_value
+                    })
+
+                inner_hooks = entry.get("hooks")
+                if not isinstance(inner_hooks, list):
+                    analysis["malformed_hooks_lists"].append({
+                        "event": event_name,
+                        "matcher": matcher_value,
+                        "actual_type": type(inner_hooks).__name__ if inner_hooks is not None else "missing"
+                    })
+                    continue
+
+                for hook_index, hook in enumerate(inner_hooks):
+                    if not isinstance(hook, dict):
+                        analysis["malformed_hook_items"].append({
+                            "event": event_name,
+                            "matcher": matcher_value,
+                            "index": hook_index,
+                            "actual_type": type(hook).__name__
+                        })
+                        continue
+
+                    hook_type = str(hook.get("type", "unknown"))
+                    analysis["hooks_by_type"][hook_type] = analysis["hooks_by_type"].get(hook_type, 0) + 1
+                    analysis["total_hooks"] += 1
+
+                    handler_valid = True
+
+                    if not event_supported:
+                        # Unknown events are schema errors and should not be treated
+                        # as executable behavioral risk.
+                        handler_valid = False
+
+                    if hook_type not in VALID_HOOK_TYPES:
+                        analysis["unknown_hook_types"].append({
+                            "event": event_name,
+                            "matcher": matcher_value,
+                            "type": hook_type
+                        })
+                        handler_valid = False
+
+                    if event_name in COMMAND_ONLY_EVENTS and hook_type != "command":
+                        analysis["wrong_type_hooks"].append({
+                            "event": event_name,
+                            "matcher": matcher_value,
+                            "type": hook_type
+                        })
+                        handler_valid = False
+                    elif event_name in ALL_TYPE_HOOK_EVENTS:
+                        pass
+                    elif event_name in VALID_HOOK_EVENTS and hook_type != "command":
+                        # Safety fallback: if event mapping is extended but not categorized yet,
+                        # treat non-command types as unsupported until constants are updated.
+                        analysis["wrong_type_hooks"].append({
+                            "event": event_name,
+                            "matcher": matcher_value,
+                            "type": hook_type
+                        })
+                        handler_valid = False
+
+                    hook_record = {
+                        "event": event_name,
+                        "matcher": matcher_value,
+                        "type": hook_type
+                    }
+
+                    for field in ("timeout", "statusMessage", "once"):
+                        if field in hook:
+                            hook_record[field] = hook.get(field)
+
+                    required_field = REQUIRED_HOOK_FIELD_BY_TYPE.get(hook_type)
+                    if required_field:
+                        required_value = hook.get(required_field)
+                        if not isinstance(required_value, str) or not required_value.strip():
+                            analysis["missing_required_fields"].append({
+                                "event": event_name,
+                                "matcher": matcher_value,
+                                "type": hook_type,
+                                "field": required_field
+                            })
+                            handler_valid = False
+
+                    if "async" in hook and hook_type != "command":
+                        analysis["async_not_command"].append({
+                            "event": event_name,
+                            "matcher": matcher_value,
+                            "type": hook_type
+                        })
+                        handler_valid = False
+
+                    if hook_type == "command":
+                        command_str = str(hook.get("command", ""))
+                        hook_record["command"] = command_str
+                        if "async" in hook:
+                            hook_record["async"] = hook.get("async")
+                        if handler_valid:
+                            for pattern, description in SUSPICIOUS_HOOK_COMMAND_PATTERNS:
+                                if re.search(pattern, command_str, re.IGNORECASE):
+                                    finding_key = (event_name, matcher_value, command_str, description)
+                                    if finding_key in seen_command_findings:
+                                        continue
+                                    seen_command_findings.add(finding_key)
+                                    analysis["suspicious_commands"].append({
+                                        "event": event_name,
+                                        "matcher": matcher_value,
+                                        "command": command_str,
+                                        "pattern": description,
+                                        "severity": "critical",
+                                        "remediation": HOOK_COMMAND_PATTERN_REMEDIATION.get(
+                                            pattern,
+                                            REMEDIATION_GUIDANCE.get("dangerous_hook_command", "")
+                                        )
+                                    })
+                    elif hook_type == "http":
+                        url = str(hook.get("url", ""))
+                        headers = hook.get("headers", {})
+                        hook_record["url"] = url
+                        hook_record["headers"] = headers
+                        if "allowedEnvVars" in hook:
+                            hook_record["allowedEnvVars"] = hook.get("allowedEnvVars")
+                        if handler_valid and url.strip():
+                            analysis["http_endpoints"].append({
+                                "event": event_name,
+                                "matcher": matcher_value,
+                                "url": url,
+                                "headers": headers
+                            })
+                    elif hook_type in {"prompt", "agent"}:
+                        hook_record["prompt"] = str(hook.get("prompt", ""))
+                        if "model" in hook:
+                            hook_record["model"] = hook.get("model")
+
+                    if handler_valid:
+                        analysis["valid_hook_handlers"] += 1
+                        analysis["hooks"].append(hook_record)
+                    else:
+                        analysis["invalid_hook_handlers"] += 1
+
+        # Behavioral risk is independent from config/logic quality.
+        if analysis["suspicious_commands"]:
+            analysis["risk_level"] = "critical"
+            analysis["behavioral_risk_reasons"].append("suspicious_command_pattern")
+        elif analysis["http_endpoints"]:
+            analysis["risk_level"] = "high"
+            analysis["behavioral_risk_reasons"].append("http_hook_endpoint")
+        elif analysis["valid_hook_handlers"] > 0:
+            analysis["risk_level"] = "medium"
+            analysis["behavioral_risk_reasons"].append("hooks_present")
+        else:
+            analysis["risk_level"] = "low"
+
+        config_error_fields = {
+            "unknown_events": analysis["unknown_events"],
+            "unknown_hook_types": analysis["unknown_hook_types"],
+            "wrong_type_hooks": analysis["wrong_type_hooks"],
+            "invalid_matchers": analysis["invalid_matchers"],
+            "malformed_event_entries": analysis["malformed_event_entries"],
+            "malformed_matcher_groups": analysis["malformed_matcher_groups"],
+            "malformed_hooks_lists": analysis["malformed_hooks_lists"],
+            "malformed_hook_items": analysis["malformed_hook_items"],
+            "missing_required_fields": analysis["missing_required_fields"],
+            "async_not_command": analysis["async_not_command"],
+        }
+        config_warning_fields = {
+            "ignored_matchers": analysis["ignored_matchers"],
+        }
+
+        error_reasons = [name for name, values in config_error_fields.items() if values]
+        warning_reasons = [name for name, values in config_warning_fields.items() if values]
+        analysis["config_quality_reasons"] = error_reasons + warning_reasons
+
+        if error_reasons:
+            analysis["config_quality"] = "error"
+        elif warning_reasons:
+            analysis["config_quality"] = "warning"
+        else:
+            analysis["config_quality"] = "clean"
+
+        return analysis
+
     def parse_skill(self, skill_dir: str) -> Dict[str, Any]:
         """
         Parse a single skill directory.
@@ -566,6 +927,7 @@ class SkillScanner:
             "references": [],
             "assets": [],
             "allowed_tools_analysis": {},
+            "hooks_analysis": {},
             "security_flags": [],
             "manifest_issues": [],
             "parse_errors": []
@@ -624,6 +986,169 @@ class SkillScanner:
                         "details": f"Dangerous tool patterns: {skill_info['allowed_tools_analysis']['dangerous_patterns']}",
                         "remediation": REMEDIATION_GUIDANCE.get("dangerous_permissions", "")
                     })
+
+            hooks_data = frontmatter.get("hooks")
+            if hooks_data is not None and isinstance(hooks_data, dict):
+                hooks_analysis = self._analyze_hooks(hooks_data)
+                skill_info["hooks_analysis"] = hooks_analysis
+
+                for finding in hooks_analysis["suspicious_commands"]:
+                    source = f"hooks.{finding['event']}"
+                    if finding.get("matcher") is not None:
+                        matcher_display = finding["matcher"] if finding["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "dangerous_hook_command",
+                        "severity": finding["severity"],
+                        "source": source,
+                        "details": f"Hook command contains: {finding['pattern']} - Command: '{finding['command'][:100]}'",
+                        "remediation": finding.get("remediation", REMEDIATION_GUIDANCE.get("dangerous_hook_command", ""))
+                    })
+
+                for endpoint in hooks_analysis["http_endpoints"]:
+                    source = f"hooks.{endpoint['event']}"
+                    if endpoint.get("matcher") is not None:
+                        matcher_display = endpoint["matcher"] if endpoint["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_http_endpoint",
+                        "severity": "high",
+                        "source": source,
+                        "details": f"HTTP hook sends event data to: {endpoint['url']}",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_http_endpoint", "")
+                    })
+
+                if hooks_analysis["unknown_events"]:
+                    skill_info["security_flags"].append({
+                        "type": "hook_unknown_event",
+                        "severity": "medium",
+                        "details": f"Unrecognized hook events: {', '.join(hooks_analysis['unknown_events'])}",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_unknown_event", "")
+                    })
+
+                for item in hooks_analysis["unknown_hook_types"]:
+                    source = f"hooks.{item['event']}"
+                    if item.get("matcher") is not None:
+                        matcher_display = item["matcher"] if item["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_unknown_type",
+                        "severity": "high",
+                        "source": source,
+                        "details": f"Unrecognized hook type '{item['type']}' on event '{item['event']}'",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_unknown_type", "")
+                    })
+
+                for item in hooks_analysis["invalid_matchers"]:
+                    source = f"hooks.{item['event']}"
+                    if item.get("matcher") is not None:
+                        matcher_display = item["matcher"] if item["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_invalid_matcher",
+                        "severity": "medium",
+                        "source": source,
+                        "details": f"Invalid matcher: {item['reason']}",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_invalid_matcher", "")
+                    })
+
+                for item in hooks_analysis["ignored_matchers"]:
+                    skill_info["security_flags"].append({
+                        "type": "hook_ignored_matcher",
+                        "severity": "low",
+                        "details": f"Matcher '{item['matcher']}' on event '{item['event']}' is ignored because this event does not support matchers",
+                        "remediation": "Remove the matcher or move the hook to an event that supports matcher filtering."
+                    })
+
+                for item in hooks_analysis["wrong_type_hooks"]:
+                    source = f"hooks.{item['event']}"
+                    if item.get("matcher") is not None:
+                        matcher_display = item["matcher"] if item["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_wrong_type",
+                        "severity": "medium",
+                        "source": source,
+                        "details": f"Hook type '{item['type']}' is not supported on event '{item['event']}' (command only)",
+                        "remediation": "Change the hook type to 'command' or move it to an event that supports this hook type."
+                    })
+
+                for item in hooks_analysis["malformed_event_entries"]:
+                    skill_info["security_flags"].append({
+                        "type": "hook_malformed_event_entries",
+                        "severity": "medium",
+                        "source": f"hooks.{item['event']}",
+                        "details": f"Hook event '{item['event']}' must map to a list, got {item['actual_type']}",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_malformed_event_entries", "")
+                    })
+
+                for item in hooks_analysis["malformed_matcher_groups"]:
+                    skill_info["security_flags"].append({
+                        "type": "hook_malformed_matcher_group",
+                        "severity": "medium",
+                        "source": f"hooks.{item['event']}",
+                        "details": f"Matcher group at index {item['index']} must be an object, got {item['actual_type']}",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_malformed_matcher_group", "")
+                    })
+
+                for item in hooks_analysis["malformed_hooks_lists"]:
+                    source = f"hooks.{item['event']}"
+                    if item.get("matcher") is not None:
+                        matcher_display = item["matcher"] if item["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_malformed_hooks_list",
+                        "severity": "medium",
+                        "source": source,
+                        "details": f"'hooks' must be a list, got {item['actual_type']}",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_malformed_hooks_list", "")
+                    })
+
+                for item in hooks_analysis["malformed_hook_items"]:
+                    source = f"hooks.{item['event']}"
+                    if item.get("matcher") is not None:
+                        matcher_display = item["matcher"] if item["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_malformed_hook_item",
+                        "severity": "medium",
+                        "source": source,
+                        "details": f"Hook handler at index {item['index']} must be an object, got {item['actual_type']}",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_malformed_hook_item", "")
+                    })
+
+                for item in hooks_analysis["missing_required_fields"]:
+                    source = f"hooks.{item['event']}"
+                    if item.get("matcher") is not None:
+                        matcher_display = item["matcher"] if item["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_missing_required_field",
+                        "severity": "medium",
+                        "source": source,
+                        "details": f"Hook type '{item['type']}' is missing required field '{item['field']}'",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_missing_required_field", "")
+                    })
+
+                for item in hooks_analysis["async_not_command"]:
+                    source = f"hooks.{item['event']}"
+                    if item.get("matcher") is not None:
+                        matcher_display = item["matcher"] if item["matcher"] != "" else '""'
+                        source += f"[matcher={matcher_display}]"
+                    skill_info["security_flags"].append({
+                        "type": "hook_async_not_command",
+                        "severity": "medium",
+                        "source": source,
+                        "details": f"Hook type '{item['type']}' cannot use 'async'",
+                        "remediation": REMEDIATION_GUIDANCE.get("hook_async_not_command", "")
+                    })
+            elif hooks_data is not None:
+                skill_info["security_flags"].append({
+                    "type": "hook_malformed_config",
+                    "severity": "medium",
+                    "details": f"Hooks frontmatter is malformed: expected a mapping of event names to matcher groups, got {type(hooks_data).__name__}",
+                    "remediation": REMEDIATION_GUIDANCE.get("hook_malformed_config", "")
+                })
 
         except Exception as e:
             skill_info["parse_errors"].append(f"Failed to parse SKILL.md: {e}")
