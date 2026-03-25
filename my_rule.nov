@@ -3,8 +3,11 @@ rule DetectJailbreaking
     meta:
         description = "Detects jailbreaking"
         author = "Thomas Roccia"
-        version = "1.0"
+        version = "1.0.0"
         severity = "critical"
+        category = "prompt_manipulation/direct_injection"
+        uuid = "eb3e40f2-b316-42d2-b072-50ad420cc02c"
+        date = "2026-03-25"
         
     keywords:
         $previous = "previous instructions"
