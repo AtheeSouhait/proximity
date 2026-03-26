@@ -11,8 +11,12 @@
 rule DetectSkillPromptInjection {
     meta:
         description = "Detects prompt injection attempts in skill definitions"
+        uuid = "7faacd23-457f-4c7b-87c7-38198c4d5e60"
+        author = "Thomas Roccia (@fr0gger_), Marco Pedrinazzi (@pedrinazziM)"
+        version = "1.0.0"
         severity = "critical"
-        category = "prompt_injection"
+        category = "prompt_manipulation/direct_injection"
+        date = "2026-03-25"
 
     keywords:
         // Direct instruction override attempts
@@ -51,6 +55,7 @@ rule DetectSkillPromptInjection {
         $secret_instruction = "[SECRET]"
         $admin_only = "[ADMIN]"
         $invisible = "<!-- "
+        $markdown_reference_link = /\[[^\]]*\]:\s*(?:#|<>)\s*(?:"[^"]*"|\([^)]*\))/
 
     semantics:
         $override_intent = "override or bypass system instructions" (0.4)
@@ -64,8 +69,12 @@ rule DetectSkillPromptInjection {
 rule DetectMaliciousToolPermissions {
     meta:
         description = "Detects dangerous allowed-tools patterns that grant excessive permissions"
+        uuid = "f9eca781-816b-481a-8975-9ca4d136821f"
+        author = "Thomas Roccia (@fr0gger_)"
+        version = "1.0.0"
         severity = "high"
-        category = "excessive_permissions"
+        category = "abusing_functions/agentic_misuse"
+        date = "2026-03-25"
 
     keywords:
         // Wildcard permissions
@@ -103,8 +112,12 @@ rule DetectMaliciousToolPermissions {
 rule DetectSuspiciousScriptPatterns {
     meta:
         description = "Detects suspicious patterns in bundled scripts that may indicate malicious intent"
+        uuid = "f22c8dda-3827-458c-aebb-dee2dbb86414"
+        author = "Thomas Roccia (@fr0gger_)"
+        version = "1.0.0"
         severity = "high"
-        category = "malicious_code"
+        category = "abusing_functions/supply_chain"
+        date = "2026-03-25"
 
     keywords:
         // Dynamic code execution
@@ -165,8 +178,12 @@ rule DetectSuspiciousScriptPatterns {
 rule DetectHiddenInstructions {
     meta:
         description = "Detects hidden instructions in references or documentation that may be injection attempts"
+        uuid = "1bfaecef-2a06-49fb-ac72-09f28e6be4af"
+        author = "Thomas Roccia (@fr0gger_), Marco Pedrinazzi (@pedrinazziM)"
+        version = "1.0.0"
         severity = "medium"
-        category = "hidden_injection"
+        category = "prompt_manipulation/indirect_injection"
+        date = "2026-03-25"
 
     keywords:
         // HTML comments used to hide content
@@ -192,6 +209,9 @@ rule DetectHiddenInstructions {
         // Base64 encoded content (potential hidden payloads)
         $base64_pattern = "data:text/plain;base64"
 
+        //invisible markdown reference link patterns
+        $markdown_reference_link = /\[[^\]]*\]:\s*(?:#|<>)\s*(?:"[^"]*"|\([^)]*\))/
+
     semantics:
         $hidden_content = "hidden or invisible content that could contain instructions" (0.3)
         $embedded_payload = "embedded instructions disguised as documentation" (0.3)
@@ -203,8 +223,12 @@ rule DetectHiddenInstructions {
 rule DetectImpersonationAttempts {
     meta:
         description = "Detects attempts to impersonate official sources or trusted authors"
+        uuid = "61162ec4-2482-4629-a254-521af6ae0d3a"
+        author = "Thomas Roccia (@fr0gger_)"
+        version = "1.0.0"
         severity = "medium"
-        category = "impersonation"
+        category = "abusing_functions/social_engineering"
+        date = "2026-03-25"
 
     keywords:
         // Official organization impersonation
@@ -239,8 +263,12 @@ rule DetectImpersonationAttempts {
 rule DetectDataExfiltration {
     meta:
         description = "Detects patterns that suggest data exfiltration or unauthorized data access"
+        uuid = "cff6521c-6a54-4938-9f04-6e9992bfacb7"
+        author = "Thomas Roccia (@fr0gger_)"
+        version = "1.0.0"
         severity = "critical"
-        category = "data_theft"
+        category = "abusing_functions/data_exfiltration"
+        date = "2026-03-25"
 
     keywords:
         // File system access patterns
