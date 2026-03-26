@@ -40,6 +40,7 @@ Examples:
 
 import argparse
 import asyncio
+import copy
 import json
 import sys
 import os
@@ -59,6 +60,7 @@ TOOL_DESCRIPTION = "MCP and Skills Security Scanner"
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
+ORANGE = "\033[38;5;208m"
 BLUE = "\033[94m"
 CYAN = "\033[96m"
 BOLD = "\033[1m"
@@ -74,6 +76,336 @@ class ProximityReporter:
         self.nova_analysis = nova_analysis
         self.scan_mode = scan_mode  # "mcp" or "skill"
         self.full_output = full_output
+
+    def _format_hook_matcher(self, matcher):
+        """Format matcher value for display while preserving explicit empty strings."""
+        if matcher is None:
+            return "—"
+        if matcher == "":
+            return '""'
+        return str(matcher)
+
+    def _hook_event_timing(self, event_name: str) -> str:
+        """Human-readable event timing summary based on Claude Code hook docs."""
+        timings = {
+            "SessionStart": "when a session begins or resumes",
+            "UserPromptSubmit": "before Claude processes a submitted prompt",
+            "PreToolUse": "before a tool call executes",
+            "PermissionRequest": "when a permission dialog appears",
+            "PostToolUse": "after a tool call succeeds",
+            "PostToolUseFailure": "after a tool call fails",
+            "Notification": "when Claude Code sends a notification",
+            "SubagentStart": "when a subagent is spawned",
+            "SubagentStop": "when a subagent finishes",
+            "Stop": "when Claude finishes responding",
+            "StopFailure": "when a turn ends due to an API error",
+            "TeammateIdle": "when a teammate is about to go idle",
+            "TaskCompleted": "when a task is being marked completed",
+            "InstructionsLoaded": "when instruction files are loaded into context",
+            "ConfigChange": "when configuration changes during a session",
+            "WorktreeCreate": "when a worktree is being created",
+            "WorktreeRemove": "when a worktree is being removed",
+            "PreCompact": "before context compaction",
+            "PostCompact": "after context compaction completes",
+            "Elicitation": "when an MCP server requests user input",
+            "ElicitationResult": "after a user responds to an MCP elicitation",
+            "SessionEnd": "when a session terminates",
+        }
+        return timings.get(str(event_name), f"when event '{event_name}' fires")
+
+    def _hook_matcher_scope(self, event_name: str, matcher) -> str:
+        """Explain matcher semantics for an event."""
+        no_matcher_events = {
+            "UserPromptSubmit", "Stop", "TeammateIdle", "TaskCompleted",
+            "WorktreeCreate", "WorktreeRemove"
+        }
+        matcher_fields = {
+            "PreToolUse": "tool name",
+            "PostToolUse": "tool name",
+            "PostToolUseFailure": "tool name",
+            "PermissionRequest": "tool name",
+            "SessionStart": "session start source",
+            "SessionEnd": "session end reason",
+            "Notification": "notification type",
+            "SubagentStart": "agent type",
+            "SubagentStop": "agent type",
+            "PreCompact": "compaction trigger",
+            "PostCompact": "compaction trigger",
+            "ConfigChange": "configuration source",
+            "StopFailure": "error type",
+            "InstructionsLoaded": "load reason",
+            "Elicitation": "MCP server name",
+            "ElicitationResult": "MCP server name",
+        }
+
+        event = str(event_name)
+        matcher_value = matcher if matcher is not None else None
+
+        if event in no_matcher_events:
+            if matcher_value is not None:
+                return "matcher is ignored for this event (it always runs)"
+            return "runs on every occurrence (no matcher support)"
+
+        field = matcher_fields.get(event)
+        if matcher_value in (None, "", "*"):
+            if field:
+                return f"matches all {field} values"
+            return "matches all occurrences"
+
+        formatted = self._format_hook_matcher(matcher_value)
+        if field:
+            return f"matcher filters {field} with regex {formatted}"
+        return f"matcher regex is {formatted}"
+
+    def _hook_action_summary(self, hook_type: str) -> str:
+        """Explain what a hook handler type does."""
+        action_by_type = {
+            "command": "executes a shell command",
+            "http": "sends hook JSON as an HTTP POST request",
+            "prompt": "runs a single-turn LLM prompt evaluation",
+            "agent": "runs an agent-based verifier with tool access",
+        }
+        return action_by_type.get(str(hook_type), f"uses handler type '{hook_type}'")
+
+    def _hook_behavior_summary(self, hook: dict) -> str:
+        """Build a single sentence that explains event timing, matcher, and action."""
+        event_name = str(hook.get("event", "unknown"))
+        matcher = hook.get("matcher")
+        hook_type = str(hook.get("type", "unknown"))
+        timing = self._hook_event_timing(event_name)
+        matcher_scope = self._hook_matcher_scope(event_name, matcher)
+        action = self._hook_action_summary(hook_type)
+        return f"Runs {timing}; {matcher_scope}; {action}."
+
+    def _format_hook_options(self, hook: dict) -> str:
+        """Format optional hook handler fields for display."""
+        options = []
+        for field in ("timeout", "statusMessage", "once", "async", "model"):
+            if field in hook:
+                options.append(f"{field}={hook[field]}")
+        if hook.get("allowedEnvVars"):
+            options.append(f"allowedEnvVars={hook['allowedEnvVars']}")
+        return ", ".join(str(option) for option in options)
+
+    def _hook_compliance_items(self, hooks_analysis: dict):
+        """Return hook schema compliance counters for reporting."""
+        checks = [
+            ("Unknown events", "unknown_events"),
+            ("Unknown hook types", "unknown_hook_types"),
+            ("Type not supported by event", "wrong_type_hooks"),
+            ("Ignored matchers", "ignored_matchers"),
+            ("Invalid matcher regex/type", "invalid_matchers"),
+            ("Malformed event entries", "malformed_event_entries"),
+            ("Malformed matcher groups", "malformed_matcher_groups"),
+            ("Malformed hooks lists", "malformed_hooks_lists"),
+            ("Malformed hook items", "malformed_hook_items"),
+            ("Missing required fields", "missing_required_fields"),
+            ("Async on non-command hooks", "async_not_command"),
+        ]
+        return [
+            (label, len(hooks_analysis.get(key, [])))
+            for label, key in checks
+            if len(hooks_analysis.get(key, [])) > 0
+        ]
+
+    def _sorted_hook_details(self, hooks: list):
+        """Sort hooks for deterministic output."""
+        return sorted(
+            hooks,
+            key=lambda hook: (
+                str(hook.get("event", "")),
+                "" if hook.get("matcher") is None else str(hook.get("matcher")),
+                str(hook.get("type", "")),
+                str(hook.get("command") or hook.get("url") or hook.get("prompt") or "")
+            )
+        )
+
+    def _hook_behavioral_flag_types(self) -> set:
+        """Hook finding types that represent behavioral execution risk."""
+        return {
+            "dangerous_hook_command",
+            "hook_http_endpoint",
+        }
+
+    def _hook_config_flag_types(self) -> set:
+        """Hook finding types that represent config/logic quality issues."""
+        return {
+            "hook_malformed_config",
+            "hook_malformed_event_entries",
+            "hook_malformed_matcher_group",
+            "hook_malformed_hooks_list",
+            "hook_malformed_hook_item",
+            "hook_invalid_matcher",
+            "hook_missing_required_field",
+            "hook_async_not_command",
+            "hook_unknown_event",
+            "hook_unknown_type",
+            "hook_wrong_type",
+            "hook_ignored_matcher",
+        }
+
+    def _format_hook_config_quality(self, config_quality: str):
+        """Return icon/colorized label for hook config quality."""
+        if config_quality == "error":
+            return f"🔴 {RED}ERROR{RESET}"
+        if config_quality == "warning":
+            return f"🟡 {YELLOW}WARNING{RESET}"
+        return f"🟢 {GREEN}CLEAN{RESET}"
+
+    def _hooks_guidance_text(self) -> str:
+        """Canonical guidance text for detected hook usage."""
+        return (
+            "Review all hook definitions carefully. Hooks execute automatically during Claude Code "
+            "lifecycle events. Remove hooks unless they are essential and from a trusted source."
+        )
+
+    def _severity_style(self, severity: str):
+        """Return (icon, color) pair for a severity label."""
+        sev = str(severity or "").lower()
+        if sev == "critical":
+            return "🔴", RED
+        if sev == "high":
+            return "🟠", ORANGE
+        if sev == "medium":
+            return "🟡", YELLOW
+        if sev == "low":
+            return "🟢", GREEN
+        return "⚪", CYAN
+
+    def _risk_style(self, risk_level: str):
+        """Return (icon, color) pair for risk level labels."""
+        return self._severity_style(risk_level)
+
+    def _severity_rank(self, severity: str) -> int:
+        """Sort key rank for severity ordering."""
+        ranks = {
+            "critical": 0,
+            "high": 1,
+            "medium": 2,
+            "low": 3,
+        }
+        return ranks.get(str(severity or "").lower(), 4)
+
+    def _sort_flags_by_severity(self, flags: list) -> list:
+        """Return flags ordered by severity while preserving relative order within each level."""
+        return sorted(
+            enumerate(flags),
+            key=lambda item: (self._severity_rank(item[1].get("severity")), item[0])
+        )
+
+    def _format_security_flag_lines(self, flag: dict) -> list:
+        """Format a security flag into printable lines."""
+        lines = []
+        severity = flag.get("severity", "unknown")
+        sev_icon, sev_color = self._severity_style(severity)
+
+        lines.append(f"      {sev_icon} {sev_color}[{severity.upper()}]{RESET} {flag['type']}")
+
+        if flag.get("source"):
+            source_info = flag["source"]
+            if flag.get("line_number"):
+                source_info += f":{flag['line_number']}"
+            lines.append(f"         📍 Source: {source_info}")
+
+        if flag.get("line_content"):
+            line_content = flag.get("line_content", "")
+            if len(line_content) > 120 and not self.full_output:
+                line_content = line_content[:120] + f"... [+{len(flag['line_content'])-120}]"
+            lines.append(f"         📝 Code: {CYAN}{line_content}{RESET}")
+
+        if flag.get("package"):
+            lines.append(f"         📦 Package: {flag['package']}")
+
+        if flag.get("required_tool"):
+            lines.append(f"         🔧 Required Tool: {flag['required_tool']}")
+
+        if flag.get("details"):
+            details = flag.get("details", "")
+            if len(details) > 150 and not self.full_output:
+                details = details[:150] + f"... [+{len(flag['details'])-150}]"
+            lines.append(f"         ℹ️  Details: {details}")
+
+        if flag.get("remediation"):
+            lines.append(f"         {GREEN}✅ Remediation:{RESET} {flag['remediation']}")
+
+        return lines
+
+    def _build_security_sections(self, security_flags: list, include_details: bool = True) -> dict:
+        """Build grouped, severity-ordered security sections for JSON output."""
+        flags = list(security_flags or [])
+        critical = [f for f in flags if str(f.get("severity", "")).lower() == "critical"]
+        high = [f for f in flags if str(f.get("severity", "")).lower() == "high"]
+        medium = [f for f in flags if str(f.get("severity", "")).lower() == "medium"]
+        low = [f for f in flags if str(f.get("severity", "")).lower() == "low"]
+
+        hook_behavioral_flags = [
+            f for f in flags if f.get("type") in self._hook_behavioral_flag_types()
+        ]
+        hook_config_flags = [
+            f for f in flags if f.get("type") in self._hook_config_flag_types()
+        ]
+        other_flags = [
+            f for f in flags
+            if f.get("type") not in self._hook_behavioral_flag_types()
+            and f.get("type") not in self._hook_config_flag_types()
+        ]
+
+        security_findings = [f for _, f in self._sort_flags_by_severity(hook_behavioral_flags + other_flags)]
+        hook_config_logic_findings = [f for _, f in self._sort_flags_by_severity(hook_config_flags)]
+
+        sections = {
+            "total_flags": len(flags),
+            "counts_by_severity": {
+                "critical": len(critical),
+                "high": len(high),
+                "medium": len(medium),
+                "low": len(low),
+            }
+        }
+        if include_details:
+            sections["security_findings"] = security_findings
+            sections["hook_config_logic_findings"] = hook_config_logic_findings
+        return sections
+
+    def _build_hooks_behavior_details(self, hooks_analysis: dict) -> list:
+        """Build deterministic hook details with behavior summary for JSON output."""
+        hooks = hooks_analysis.get("hooks", []) if isinstance(hooks_analysis, dict) else []
+        details = []
+        for hook in self._sorted_hook_details(hooks):
+            entry = dict(hook)
+            entry["behavior"] = self._hook_behavior_summary(hook)
+            details.append(entry)
+        return details
+
+    def _apply_json_style_sections(self, raw_results: dict) -> dict:
+        """Attach presentation-style grouped sections to JSON scan results."""
+        styled = copy.deepcopy(raw_results)
+        has_skills = isinstance(styled.get("skills"), list) and len(styled.get("skills", [])) > 0
+
+        # Top-level grouping for aggregated security flags
+        top_level_flags = styled.get("security_flags", [])
+        styled["security_sections"] = self._build_security_sections(
+            top_level_flags,
+            include_details=not has_skills
+        )
+        # Avoid duplicate representations in exported JSON.
+        styled.pop("security_flags", None)
+
+        # Per-skill grouping and hook behavior enrichment
+        skills = styled.get("skills", [])
+        if isinstance(skills, list):
+            for skill in skills:
+                if not isinstance(skill, dict):
+                    continue
+                skill_flags = skill.get("security_flags", [])
+                skill["security_sections"] = self._build_security_sections(skill_flags)
+                # Avoid duplicate representations in exported JSON.
+                skill.pop("security_flags", None)
+                hooks_analysis = skill.get("hooks_analysis", {})
+                if isinstance(hooks_analysis, dict):
+                    hooks_analysis["hooks_with_behavior"] = self._build_hooks_behavior_details(hooks_analysis)
+
+        return styled
     
     def display_console_report(self):
         """Display a nice terminal report."""
@@ -386,18 +718,7 @@ class ProximityReporter:
 
             if tools_analysis and tools_analysis.get("tool_count", 0) > 0:
                 risk_level = tools_analysis.get("risk_level", "low")
-                if risk_level == "critical":
-                    risk_color = RED
-                    risk_icon = "🔴"
-                elif risk_level == "high":
-                    risk_color = RED
-                    risk_icon = "🟠"
-                elif risk_level == "medium":
-                    risk_color = YELLOW
-                    risk_icon = "🟡"
-                else:
-                    risk_color = GREEN
-                    risk_icon = "🟢"
+                risk_icon, risk_color = self._risk_style(risk_level)
 
                 print(f"   {CYAN}Tool Count:{RESET} {tools_analysis['tool_count']}")
                 print(f"   {CYAN}Risk Level:{RESET} {risk_icon} {risk_color}{risk_level.upper()}{RESET}")
@@ -420,7 +741,79 @@ class ProximityReporter:
                 print(f"   {YELLOW}Note: Skills without declared tools may request permissions at runtime{RESET}")
 
             # ═══════════════════════════════════════════════════════════
-            # SECTION 4: SECURITY ANALYSIS
+            # SECTION 4: HOOKS
+            # ═══════════════════════════════════════════════════════════
+            hooks_analysis = skill.get("hooks_analysis", {})
+            compliance_items = self._hook_compliance_items(hooks_analysis)
+            has_hook_details = bool(hooks_analysis.get("hooks"))
+            has_hook_data = (
+                bool(hooks_analysis)
+                and (
+                    hooks_analysis.get("total_hooks", 0) > 0
+                    or hooks_analysis.get("valid_hook_handlers", 0) > 0
+                    or len(compliance_items) > 0
+                )
+            )
+            if has_hook_data:
+                risk_level = hooks_analysis.get("risk_level", "low")
+                risk_icon, risk_color = self._risk_style(risk_level)
+
+                print(f"\n{BOLD}{CYAN}[HOOKS] Claude Code Hooks{RESET}")
+                print(f"{CYAN}{'-' * 50}{RESET}")
+                hook_events = sorted(str(event) for event in hooks_analysis.get("hook_events", []))
+                print(f"   {CYAN}Hook Events:{RESET} {len(hook_events)}")
+                print(f"   {CYAN}Total Handlers:{RESET} {hooks_analysis.get('total_hooks', 0)}")
+                print(f"   {CYAN}Valid Handlers:{RESET} {hooks_analysis.get('valid_hook_handlers', 0)}")
+                print(f"   {CYAN}Invalid Handlers:{RESET} {hooks_analysis.get('invalid_hook_handlers', 0)}")
+                print(f"   {CYAN}Behavioral Risk:{RESET} {risk_icon} {risk_color}{risk_level.upper()}{RESET}")
+                print(
+                    f"   {CYAN}Config Quality:{RESET} "
+                    f"{self._format_hook_config_quality(hooks_analysis.get('config_quality', 'clean'))}"
+                )
+                if hooks_analysis.get("valid_hook_handlers", 0) > 0:
+                    print(f"   {CYAN}Guidance:{RESET} {self._hooks_guidance_text()}")
+
+                hook_types = hooks_analysis.get("hooks_by_type", {})
+                if hook_types:
+                    print(f"   {CYAN}Types:{RESET}")
+                    for hook_type in sorted(hook_types):
+                        count = hook_types[hook_type]
+                        if hook_type == "command":
+                            icon = "🔴"
+                        elif hook_type == "http":
+                            icon = "🟠"
+                        elif hook_type in {"prompt", "agent"}:
+                            icon = "🟡"
+                        else:
+                            icon = "⚪"
+                        print(f"      {icon} {hook_type}: {count}")
+
+                if compliance_items:
+                    print(f"   {CYAN}Schema Compliance:{RESET}")
+                    for label, count in compliance_items:
+                        print(f"      ⚠️ {label}: {count}")
+
+                if has_hook_details:
+                    print(f"\n   {CYAN}Hook Details:{RESET}")
+                    for hook in self._sorted_hook_details(hooks_analysis.get("hooks", [])):
+                        matcher = hook.get("matcher")
+                        matcher_str = f" [matcher: {self._format_hook_matcher(matcher)}]" if matcher is not None else ""
+                        print(f"      {hook['event']}{matcher_str}")
+                        if hook["type"] == "command":
+                            print(f"         ⚡ command: {hook.get('command', '')[:80]}")
+                        elif hook["type"] == "http":
+                            print(f"         🌐 url: {hook.get('url', '')}")
+                        elif hook["type"] in {"prompt", "agent"}:
+                            print(f"         🤖 {hook['type']}: {hook.get('prompt', '')[:80]}")
+                        else:
+                            print(f"         ⚪ {hook['type']}")
+                        print(f"         {CYAN}behavior:{RESET} {self._hook_behavior_summary(hook)}")
+                        options = self._format_hook_options(hook)
+                        if options:
+                            print(f"         {CYAN}options:{RESET} {options}")
+
+            # ═══════════════════════════════════════════════════════════
+            # SECTION 5: SECURITY ANALYSIS
             # ═══════════════════════════════════════════════════════════
             security_flags = skill.get("security_flags", [])
             print(f"\n{BOLD}{RED if security_flags else GREEN}[SECURITY] Security Analysis{RESET}")
@@ -428,56 +821,46 @@ class ProximityReporter:
 
             if security_flags:
                 # Group by severity
-                critical_high = [f for f in security_flags if f.get("severity") in ["critical", "high"]]
+                critical = [f for f in security_flags if f.get("severity") == "critical"]
+                high = [f for f in security_flags if f.get("severity") == "high"]
                 medium = [f for f in security_flags if f.get("severity") == "medium"]
                 low = [f for f in security_flags if f.get("severity") == "low"]
 
                 print(f"   {CYAN}Total Flags:{RESET} {len(security_flags)}")
-                print(f"      {RED}Critical/High:{RESET} {len(critical_high)}")
+                print(f"      {RED}Critical:{RESET} {len(critical)}")
+                print(f"      {ORANGE}High:{RESET} {len(high)}")
                 print(f"      {YELLOW}Medium:{RESET} {len(medium)}")
                 print(f"      {GREEN}Low:{RESET} {len(low)}")
 
-                print(f"\n   {BOLD}{RED}Security Findings:{RESET}")
-                for flag in security_flags:
-                    severity = flag.get("severity", "unknown")
-                    if severity in ["critical", "high"]:
-                        sev_color = RED
-                        sev_icon = "🔴"
-                    elif severity == "medium":
-                        sev_color = YELLOW
-                        sev_icon = "🟡"
-                    else:
-                        sev_color = GREEN
-                        sev_icon = "🟢"
+                hook_behavioral_flags = [
+                    f for f in security_flags if f.get("type") in self._hook_behavioral_flag_types()
+                ]
+                hook_config_flags = [
+                    f for f in security_flags if f.get("type") in self._hook_config_flag_types()
+                ]
+                other_flags = [
+                    f for f in security_flags
+                    if f.get("type") not in self._hook_behavioral_flag_types()
+                    and f.get("type") not in self._hook_config_flag_types()
+                ]
+                security_findings = [f for _, f in self._sort_flags_by_severity(hook_behavioral_flags + other_flags)]
+                hook_config_flags = [f for _, f in self._sort_flags_by_severity(hook_config_flags)]
 
-                    print(f"\n      {sev_icon} {sev_color}[{severity.upper()}]{RESET} {flag['type']}")
+                if security_findings:
+                    print(f"\n   {BOLD}{CYAN}Security Findings:{RESET}")
+                    for idx, flag in enumerate(security_findings):
+                        for line in self._format_security_flag_lines(flag):
+                            print(line)
+                        if idx < len(security_findings) - 1:
+                            print()
 
-                    if flag.get("source"):
-                        source_info = flag['source']
-                        if flag.get("line_number"):
-                            source_info += f":{flag['line_number']}"
-                        print(f"         📍 Source: {source_info}")
-
-                    if flag.get("line_content"):
-                        line_content = flag.get('line_content', '')
-                        if len(line_content) > 120 and not self.full_output:
-                            line_content = line_content[:120] + f"... [+{len(flag['line_content'])-120}]"
-                        print(f"         📝 Code: {CYAN}{line_content}{RESET}")
-
-                    if flag.get("package"):
-                        print(f"         📦 Package: {flag['package']}")
-
-                    if flag.get("required_tool"):
-                        print(f"         🔧 Required Tool: {flag['required_tool']}")
-
-                    if flag.get("details"):
-                        details = flag.get('details', '')
-                        if len(details) > 150 and not self.full_output:
-                            details = details[:150] + f"... [+{len(flag['details'])-150}]"
-                        print(f"         ℹ️  Details: {details}")
-
-                    if flag.get("remediation"):
-                        print(f"         {GREEN}✅ Remediation:{RESET} {flag['remediation']}")
+                if hook_config_flags:
+                    print(f"\n   {BOLD}{YELLOW}Hook Config/Logic Findings:{RESET}")
+                    for idx, flag in enumerate(hook_config_flags):
+                        for line in self._format_security_flag_lines(flag):
+                            print(line)
+                        if idx < len(hook_config_flags) - 1:
+                            print()
             else:
                 print(f"   {GREEN}✅ No security issues detected{RESET}")
 
@@ -609,7 +992,7 @@ class ProximityReporter:
     def export_json_report(self, filename: str):
         """Export detailed JSON report."""
         report = {
-            "scan_results": self.results,
+            "scan_results": self._apply_json_style_sections(self.results),
             "nova_analysis": self.nova_analysis,
             "export_timestamp": datetime.now().isoformat()
         }
@@ -808,7 +1191,7 @@ class ProximityReporter:
         """Export detailed JSON report for skill scan."""
         report = {
             "scan_type": "skill",
-            "scan_results": self.results,
+            "scan_results": self._apply_json_style_sections(self.results),
             "nova_analysis": self.nova_analysis,
             "export_timestamp": datetime.now().isoformat()
         }
@@ -880,29 +1263,98 @@ class ProximityReporter:
                     md_content.append(f"**Dangerous Patterns:** {', '.join(tools_analysis['dangerous_patterns'])}\n")
                 md_content.append("\n")
 
+            hooks_analysis = skill.get("hooks_analysis", {})
+            compliance_items = self._hook_compliance_items(hooks_analysis)
+            has_hook_details = bool(hooks_analysis.get("hooks"))
+            has_hook_data = (
+                bool(hooks_analysis)
+                and (
+                    hooks_analysis.get("total_hooks", 0) > 0
+                    or hooks_analysis.get("valid_hook_handlers", 0) > 0
+                    or len(compliance_items) > 0
+                )
+            )
+            if has_hook_data:
+                md_content.append("### Hooks Analysis\n\n")
+                hook_events = sorted(str(event) for event in hooks_analysis.get("hook_events", []))
+                md_content.append(f"**Hook Events:** {', '.join(hook_events)}\n")
+                md_content.append(f"**Total Handlers:** {hooks_analysis.get('total_hooks', 0)}\n")
+                md_content.append(f"**Valid Handlers:** {hooks_analysis.get('valid_hook_handlers', 0)}\n")
+                md_content.append(f"**Invalid Handlers:** {hooks_analysis.get('invalid_hook_handlers', 0)}\n")
+                md_content.append(f"**Behavioral Risk:** {hooks_analysis.get('risk_level', 'low').upper()}\n")
+                md_content.append(f"**Config Quality:** {hooks_analysis.get('config_quality', 'clean').upper()}\n")
+                if hooks_analysis.get("valid_hook_handlers", 0) > 0:
+                    md_content.append(f"**Guidance:** {self._hooks_guidance_text()}\n")
+
+                hook_types = hooks_analysis.get("hooks_by_type", {})
+                if hook_types:
+                    types_text = ", ".join(f"{hook_type}: {hook_types[hook_type]}" for hook_type in sorted(hook_types))
+                    md_content.append(f"**Types:** {types_text}\n")
+
+                if compliance_items:
+                    summary_text = ", ".join(f"{label}: {count}" for label, count in compliance_items)
+                    md_content.append(f"**Schema Compliance:** {summary_text}\n")
+
+                if has_hook_details:
+                    md_content.append("\n| Event | Matcher | Type | Command/URL/Prompt | Behavior |\n")
+                    md_content.append("|-------|---------|------|--------------------|----------|\n")
+                    for hook in self._sorted_hook_details(hooks_analysis.get("hooks", [])):
+                        matcher = self._format_hook_matcher(hook.get("matcher"))
+                        value = hook.get("command") or hook.get("url") or hook.get("prompt") or ""
+                        options = self._format_hook_options(hook)
+                        if options:
+                            value = f"{value} [{options}]"
+                        behavior = self._hook_behavior_summary(hook)
+                        matcher = str(matcher).replace("|", "\\|").replace("\n", " ")
+                        value = str(value).replace("|", "\\|").replace("\n", " ")[:120]
+                        behavior = str(behavior).replace("|", "\\|").replace("\n", " ")
+                        md_content.append(f"| {hook['event']} | {matcher} | {hook['type']} | {value} | {behavior} |\n")
+                md_content.append("\n")
+
             # Security Flags
             security_flags = skill.get("security_flags", [])
             if security_flags:
                 md_content.append("### Security Flags\n\n")
-                for flag in security_flags:
-                    severity = flag.get("severity", "unknown").upper()
-                    md_content.append(f"- **[{severity}]** {flag['type']}\n")
-                    if flag.get("source"):
-                        source_info = flag['source']
-                        if flag.get("line_number"):
-                            source_info += f":{flag['line_number']}"
-                        md_content.append(f"  - Source: `{source_info}`\n")
-                    if flag.get("line_content"):
-                        md_content.append(f"  - Line: `{flag['line_content']}`\n")
-                    if flag.get("package"):
-                        md_content.append(f"  - Package: `{flag['package']}`\n")
-                    if flag.get("required_tool"):
-                        md_content.append(f"  - Required Tool: `{flag['required_tool']}`\n")
-                    if flag.get("details"):
-                        md_content.append(f"  - Details: {flag['details']}\n")
-                    if flag.get("remediation"):
-                        md_content.append(f"  - **Remediation:** {flag['remediation']}\n")
-                md_content.append("\n")
+                hook_behavioral_flags = [
+                    f for f in security_flags if f.get("type") in self._hook_behavioral_flag_types()
+                ]
+                hook_config_flags = [
+                    f for f in security_flags if f.get("type") in self._hook_config_flag_types()
+                ]
+                other_flags = [
+                    f for f in security_flags
+                    if f.get("type") not in self._hook_behavioral_flag_types()
+                    and f.get("type") not in self._hook_config_flag_types()
+                ]
+                security_findings = [f for _, f in self._sort_flags_by_severity(hook_behavioral_flags + other_flags)]
+                hook_config_flags = [f for _, f in self._sort_flags_by_severity(hook_config_flags)]
+
+                def append_flag_block(title: str, flags: list):
+                    if not flags:
+                        return
+                    md_content.append(f"#### {title}\n\n")
+                    for flag in flags:
+                        severity = flag.get("severity", "unknown").upper()
+                        md_content.append(f"- **[{severity}]** {flag['type']}\n")
+                        if flag.get("source"):
+                            source_info = flag["source"]
+                            if flag.get("line_number"):
+                                source_info += f":{flag['line_number']}"
+                            md_content.append(f"  - Source: `{source_info}`\n")
+                        if flag.get("line_content"):
+                            md_content.append(f"  - Line: `{flag['line_content']}`\n")
+                        if flag.get("package"):
+                            md_content.append(f"  - Package: `{flag['package']}`\n")
+                        if flag.get("required_tool"):
+                            md_content.append(f"  - Required Tool: `{flag['required_tool']}`\n")
+                        if flag.get("details"):
+                            md_content.append(f"  - Details: {flag['details']}\n")
+                        if flag.get("remediation"):
+                            md_content.append(f"  - **Remediation:** {flag['remediation']}\n")
+                    md_content.append("\n")
+
+                append_flag_block("Security Findings", security_findings)
+                append_flag_block("Hook Config/Logic Findings", hook_config_flags)
 
         # Nova analysis
         if self.nova_analysis:
